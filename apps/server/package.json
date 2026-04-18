@@ -1,0 +1,19 @@
+{
+	"name": "@webterm/server",
+	"private": true,
+	"type": "module",
+	"scripts": {
+		"dev": "bun --watch index.ts",
+		"build": "bun build ./index.ts --target bun --outdir ./dist --sourcemap",
+		"start": "bun index.ts",
+		"start:dist": "bun ./dist/index.js",
+		"check": "bunx tsc --noEmit -p tsconfig.json"
+	},
+	"devDependencies": {
+		"@types/bun": "latest"
+	},
+	"dependencies": {
+		"@webterm/protocol": "workspace:*",
+		"effect": "^4.0.0-beta.50"
+	}
+}

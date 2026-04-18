@@ -1,0 +1,18 @@
+{
+	"name": "webterm-7421",
+	"private": true,
+	"type": "module",
+	"packageManager": "bun@1.3.11",
+	"workspaces": ["apps/*", "packages/*"],
+	"scripts": {
+		"dev": "bun run --parallel dev:server dev:web",
+		"dev:web": "bun run --cwd apps/web dev",
+		"dev:server": "bun run --cwd apps/server dev",
+		"build": "bun run build:web && bun run build:server",
+		"build:web": "bun run --cwd apps/web build",
+		"build:server": "bun run --cwd apps/server build",
+		"check:web": "bun run --cwd apps/web check",
+		"lint:web": "bun run --cwd apps/web lint",
+		"check:server": "bun run --cwd apps/server check"
+	}
+}

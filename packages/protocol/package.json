@@ -1,0 +1,19 @@
+{
+	"name": "@webterm/protocol",
+	"private": true,
+	"version": "0.0.1",
+	"type": "module",
+	"types": "./index.ts",
+	"exports": {
+		".": {
+			"types": "./index.ts",
+			"default": "./index.ts"
+		}
+	},
+	"scripts": {
+		"check": "bunx tsc --noEmit -p tsconfig.json"
+	},
+	"devDependencies": {
+		"@types/bun": "latest"
+	}
+}
