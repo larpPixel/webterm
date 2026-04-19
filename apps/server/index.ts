@@ -10,12 +10,12 @@ import {
 } from '@webterm/protocol';
 
 const config = {
-	host: process.env.TERMINAL_HOST ?? '127.0.0.1',
+	host: process.env.TERMINAL_HOST ?? '0.0.0.0',
 	port: Number(process.env.TERMINAL_PORT ?? '8787'),
 	allowedOriginsRaw:
 		process.env.TERMINAL_ALLOWED_ORIGINS ??
 		process.env.TERMINAL_ALLOWED_ORIGIN ??
-		'http://127.0.0.1:5173,http://localhost:5173',
+		'http://127.0.0.1:5173,http://localhost:5173,https://term.jr4.in',
 	shell: process.env.TERMINAL_SHELL ?? '/bin/bash',
 	cwd: process.env.TERMINAL_CWD ?? process.cwd(),
 	idleTimeoutMs: Number(process.env.TERMINAL_IDLE_TIMEOUT_MS ?? '900000'),
