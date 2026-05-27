@@ -16,8 +16,25 @@ const config = {
 		process.env.TERMINAL_ALLOWED_ORIGINS ??
 		process.env.TERMINAL_ALLOWED_ORIGIN ??
 		'http://127.0.0.1:5173,http://localhost:5173,https://term.jr4.in',
-	shell: process.env.TERMINAL_SHELL ?? '/bin/bash',
-	cwd: process.env.TERMINAL_CWD ?? process.cwd(),
+	shell: process.env.TERMINAL_SHELL ?? '/bin/zsh',
+	cwd: (() => {
+		const home = process.env.HOME ?? '/';
+		const raw = process.env.TERMINAL_CWD;
+
+		if (!raw || raw.trim().length === 0) {
+			return home;
+		}
+
+		if (raw === '~') {
+			return home;
+		}
+
+		if (raw.startsWith('~/')) {
+			return `${home}/${raw.slice(2)}`;
+		}
+
+		return raw;
+	})(),
 	idleTimeoutMs: Number(process.env.TERMINAL_IDLE_TIMEOUT_MS ?? '900000'),
 	defaultCols: 120,
 	defaultRows: 36
