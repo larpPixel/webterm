@@ -49,6 +49,7 @@ const allowAnyOrigin = allowedOrigins.includes('*');
 
 type SocketData = {
 	sessionId?: string;
+	expectedSessionId?: string;
 	clientId?: string;
 	attached?: boolean;
 };
@@ -63,15 +64,19 @@ type SessionRecord = {
 	lastDetachedAt: number | null;
 	cols: number;
 	rows: number;
-	process: TerminalProcess;
+	process: TerminalProcess | null;
 	ptyPath: string | null;
 	outputBuffer: string;
+	pendingOutput: string;
+	outputFlushTimer: ReturnType<typeof setTimeout> | null;
 	clients: Map<string, TerminalSocket>;
 	idleTimer: ReturnType<typeof setTimeout> | null;
 	closed: boolean;
 };
 
 const SESSION_OUTPUT_BUFFER_LIMIT = 64 * 1024;
+const OUTPUT_FLUSH_DELAY_MS = 0;
+const WEBSOCKET_BACKPRESSURE_LIMIT = 1024 * 1024;
 
 class SessionNotFound extends Data.TaggedError('SessionNotFound')<{
 	readonly sessionId: string;
@@ -90,27 +95,75 @@ const toSessionInfo = (session: SessionRecord): SessionInfo => ({
 	websocketPath: `/api/sessions/${session.id}/ws`
 });
 
-const sendEvent = (socket: TerminalSocket, event: ServerEvent) => {
-	socket.send(JSON.stringify(event));
+const sendPayload = (socket: TerminalSocket, payload: string, closeOnBackpressure = false) => {
+	const status = socket.send(payload);
+
+	if (status > 0) {
+		return true;
+	}
+
+	if (closeOnBackpressure) {
+		socket.close(1013, status === -1 ? 'terminal output backpressure' : 'terminal output dropped');
+	}
+
+	return false;
+};
+
+const sendEvent = (socket: TerminalSocket, event: ServerEvent, closeOnBackpressure = false) => {
+	return sendPayload(socket, JSON.stringify(event), closeOnBackpressure);
 };
 
 const broadcast = (session: SessionRecord, event: ServerEvent) => {
 	const payload = JSON.stringify(event);
 
 	for (const socket of session.clients.values()) {
-		socket.send(payload);
+		sendPayload(socket, payload, event.type === 'output');
 	}
 };
 
-const createTerminalProcess = (shell: string) => {
-	return Bun.spawn(['script', '-qfec', `${shell} -i`, '/dev/null'], {
+const normalizeTerminalSize = (cols: number | undefined, rows: number | undefined) => {
+	const normalizeDimension = (value: number | undefined, fallback: number) => {
+		if (typeof value !== 'number' || !Number.isFinite(value)) {
+			return fallback;
+		}
+
+		return Math.max(1, Math.min(1000, Math.floor(value)));
+	};
+
+	return {
+		cols: normalizeDimension(cols, config.defaultCols),
+		rows: normalizeDimension(rows, config.defaultRows)
+	};
+};
+
+const updateSessionSize = (
+	session: SessionRecord,
+	size: { cols: number | undefined; rows: number | undefined }
+) => {
+	const normalizedSize = normalizeTerminalSize(size.cols, size.rows);
+
+	if (normalizedSize.cols === session.cols && normalizedSize.rows === session.rows) {
+		return false;
+	}
+
+	session.cols = normalizedSize.cols;
+	session.rows = normalizedSize.rows;
+	return true;
+};
+
+const createTerminalProcess = (shell: string, size: { cols: number; rows: number }) => {
+	const command = `stty cols ${size.cols} rows ${size.rows}; exec ${shell} -i`;
+
+	return Bun.spawn(['script', '-qfec', command, '/dev/null'], {
 		stdin: 'pipe',
 		stdout: 'pipe',
 		stderr: 'pipe',
 		cwd: config.cwd,
 		env: {
 			...process.env,
-			TERM: 'xterm-256color'
+			TERM: 'xterm-256color',
+			COLUMNS: String(size.cols),
+			LINES: String(size.rows)
 		}
 	});
 };
@@ -124,6 +177,33 @@ const appendOutputBuffer = (session: SessionRecord, chunk: string) => {
 
 	if (session.outputBuffer.length > SESSION_OUTPUT_BUFFER_LIMIT) {
 		session.outputBuffer = session.outputBuffer.slice(-SESSION_OUTPUT_BUFFER_LIMIT);
+	}
+};
+
+const flushPendingOutput = (session: SessionRecord) => {
+	session.outputFlushTimer = null;
+
+	if (session.closed || session.pendingOutput.length === 0) {
+		return;
+	}
+
+	const data = session.pendingOutput;
+	session.pendingOutput = '';
+	broadcast(session, {
+		type: 'output',
+		data
+	});
+};
+
+const queueOutputBroadcast = (session: SessionRecord, chunk: string) => {
+	if (session.closed || chunk.length === 0) {
+		return;
+	}
+
+	session.pendingOutput += chunk;
+
+	if (session.outputFlushTimer === null) {
+		session.outputFlushTimer = setTimeout(() => flushPendingOutput(session), OUTPUT_FLUSH_DELAY_MS);
 	}
 };
 
@@ -153,15 +233,7 @@ const resizeSessionPty = (session: SessionRecord) => {
 	}
 
 	const resizeProcess = Bun.spawn(
-		[
-			'stty',
-			'-F',
-			session.ptyPath,
-			'cols',
-			String(session.cols),
-			'rows',
-			String(session.rows)
-		],
+		['stty', '-F', session.ptyPath, 'cols', String(session.cols), 'rows', String(session.rows)],
 		{
 			stdin: 'ignore',
 			stdout: 'ignore',
@@ -174,7 +246,10 @@ const resizeSessionPty = (session: SessionRecord) => {
 	});
 };
 
-const streamTerminalOutput = (session: SessionRecord, stream: ReadableStream<Uint8Array> | null) => {
+const streamTerminalOutput = (
+	session: SessionRecord,
+	stream: ReadableStream<Uint8Array> | null
+) => {
 	if (stream === null) {
 		return;
 	}
@@ -192,10 +267,7 @@ const streamTerminalOutput = (session: SessionRecord, stream: ReadableStream<Uin
 					appendOutputBuffer(session, tail);
 
 					if (!session.closed && tail.length > 0) {
-						broadcast(session, {
-							type: 'output',
-							data: tail
-						});
+						queueOutputBroadcast(session, tail);
 					}
 
 					break;
@@ -205,10 +277,7 @@ const streamTerminalOutput = (session: SessionRecord, stream: ReadableStream<Uin
 				appendOutputBuffer(session, chunk);
 
 				if (!session.closed) {
-					broadcast(session, {
-						type: 'output',
-						data: chunk
-					});
+					queueOutputBroadcast(session, chunk);
 				}
 			}
 		} catch (error) {
@@ -223,7 +292,9 @@ const streamTerminalOutput = (session: SessionRecord, stream: ReadableStream<Uin
 
 type TerminalRegistry = {
 	readonly createSession: Effect.Effect<SessionInfo, never>;
-	readonly getSession: (sessionId: string) => Effect.Effect<SessionInfo, SessionNotFound | SessionClosed>;
+	readonly getSession: (
+		sessionId: string
+	) => Effect.Effect<SessionInfo, SessionNotFound | SessionClosed>;
 	readonly attachClient: (
 		sessionId: string,
 		clientId: string,
@@ -235,7 +306,9 @@ type TerminalRegistry = {
 		sessionId: string,
 		message: ClientEvent
 	) => Effect.Effect<void, SessionNotFound | SessionClosed>;
-	readonly closeSession: (sessionId: string) => Effect.Effect<void, SessionNotFound | SessionClosed>;
+	readonly closeSession: (
+		sessionId: string
+	) => Effect.Effect<void, SessionNotFound | SessionClosed>;
 };
 
 const terminalRegistry: TerminalRegistry = (() => {
@@ -269,8 +342,20 @@ const terminalRegistry: TerminalRegistry = (() => {
 			return;
 		}
 
-		session.closed = true;
 		clearIdleTimer(session);
+		if (session.outputFlushTimer !== null) {
+			clearTimeout(session.outputFlushTimer);
+			session.outputFlushTimer = null;
+		}
+		if (session.pendingOutput.length > 0) {
+			const data = session.pendingOutput;
+			session.pendingOutput = '';
+			broadcast(session, {
+				type: 'output',
+				data
+			});
+		}
+		session.closed = true;
 		sessions.delete(session.id);
 		broadcast(session, {
 			type: 'exit',
@@ -288,9 +373,46 @@ const terminalRegistry: TerminalRegistry = (() => {
 
 		session.idleTimer = setTimeout(() => {
 			if (session.clients.size === 0 && !session.closed) {
+				if (session.process === null) {
+					closeRecord(session, null, null);
+					return;
+				}
+
 				session.process.kill();
 			}
 		}, config.idleTimeoutMs);
+	};
+
+	const startSessionProcess = (session: SessionRecord) => {
+		if (session.process !== null) {
+			return;
+		}
+
+		const terminalProcess = createTerminalProcess(session.shell, {
+			cols: session.cols,
+			rows: session.rows
+		});
+
+		session.process = terminalProcess;
+
+		void findProcessPtyPath(terminalProcess).then((ptyPath) => {
+			if (session.closed || session.process !== terminalProcess) {
+				return;
+			}
+
+			session.ptyPath = ptyPath;
+
+			if (ptyPath !== null) {
+				resizeSessionPty(session);
+			}
+		});
+
+		streamTerminalOutput(session, terminalProcess.stdout);
+		streamTerminalOutput(session, terminalProcess.stderr);
+
+		void terminalProcess.exited.then((exitCode) => {
+			closeRecord(session, exitCode, null);
+		});
 	};
 
 	return {
@@ -298,7 +420,6 @@ const terminalRegistry: TerminalRegistry = (() => {
 			const sessionId = randomUUID();
 			const shell = config.shell;
 			const createdAt = Date.now();
-			const terminalProcess = createTerminalProcess(shell);
 
 			const session: SessionRecord = {
 				id: sessionId,
@@ -307,34 +428,18 @@ const terminalRegistry: TerminalRegistry = (() => {
 				lastDetachedAt: null,
 				cols: config.defaultCols,
 				rows: config.defaultRows,
-				process: terminalProcess,
+				process: null,
 				ptyPath: null,
 				outputBuffer: '',
+				pendingOutput: '',
+				outputFlushTimer: null,
 				clients: new Map(),
 				idleTimer: null,
 				closed: false
 			};
 
-			void findProcessPtyPath(terminalProcess).then((ptyPath) => {
-				if (session.closed) {
-					return;
-				}
-
-				session.ptyPath = ptyPath;
-
-				if (ptyPath !== null) {
-					resizeSessionPty(session);
-				}
-			});
-
-			streamTerminalOutput(session, terminalProcess.stdout);
-			streamTerminalOutput(session, terminalProcess.stderr);
-
-			void terminalProcess.exited.then((exitCode) => {
-				closeRecord(session, exitCode, null);
-			});
-
 			sessions.set(sessionId, session);
+			scheduleIdleCleanup(session);
 
 			return toSessionInfo(session);
 		}),
@@ -345,30 +450,45 @@ const terminalRegistry: TerminalRegistry = (() => {
 					clearIdleTimer(session);
 
 					if (initialSize) {
-						session.cols = initialSize.cols;
-						session.rows = initialSize.rows;
-						resizeSessionPty(session);
+						const didResize = updateSessionSize(session, initialSize);
 
-						if (session.ptyPath === null) {
-							void findProcessPtyPath(session.process).then((ptyPath) => {
-								if (session.closed || ptyPath === null) {
-									return;
-								}
+						if (didResize && session.process !== null) {
+							resizeSessionPty(session);
 
-								session.ptyPath = ptyPath;
-								resizeSessionPty(session);
-							});
+							if (session.ptyPath === null) {
+								void findProcessPtyPath(session.process).then((ptyPath) => {
+									if (session.closed || session.process === null || ptyPath === null) {
+										return;
+									}
+
+									session.ptyPath = ptyPath;
+									resizeSessionPty(session);
+								});
+							}
+						}
+					}
+
+					session.clients.set(clientId, socket);
+
+					if (session.process === null) {
+						try {
+							startSessionProcess(session);
+						} catch (error) {
+							session.clients.delete(clientId);
+							throw error;
 						}
 					}
 
 					if (session.outputBuffer.length > 0) {
-						sendEvent(socket, {
-							type: 'output',
-							data: session.outputBuffer
-						});
+						sendEvent(
+							socket,
+							{
+								type: 'output',
+								data: session.outputBuffer
+							},
+							true
+						);
 					}
-
-					session.clients.set(clientId, socket);
 
 					sendEvent(socket, {
 						type: 'ready',
@@ -399,15 +519,15 @@ const terminalRegistry: TerminalRegistry = (() => {
 				Effect.sync(() => {
 					switch (message.type) {
 						case 'input':
-							if (session.process.stdin && typeof session.process.stdin !== 'number') {
+							if (session.process?.stdin && typeof session.process.stdin !== 'number') {
 								session.process.stdin.write(message.data);
 							}
 							return;
 
 						case 'resize':
-							session.cols = message.cols;
-							session.rows = message.rows;
-							resizeSessionPty(session);
+							if (updateSessionSize(session, message)) {
+								resizeSessionPty(session);
+							}
 							return;
 
 						case 'ping':
@@ -418,6 +538,11 @@ const terminalRegistry: TerminalRegistry = (() => {
 		closeSession: (sessionId: string) =>
 			Effect.flatMap(getSessionRecord(sessionId), (session) =>
 				Effect.sync(() => {
+					if (session.process === null) {
+						closeRecord(session, null, null);
+						return;
+					}
+
 					session.process.kill();
 				})
 			)
@@ -435,7 +560,7 @@ const corsHeaders = (request: Request) => {
 			? '*'
 			: allowedOrigins.includes(requestOrigin)
 				? requestOrigin
-				: allowedOrigins[0] ?? '*';
+				: (allowedOrigins[0] ?? '*');
 
 	return {
 		'access-control-allow-origin': allowOrigin,
@@ -524,7 +649,9 @@ const server = Bun.serve<SocketData>({
 
 		if (sessionId && request.method === 'GET' && !url.pathname.endsWith('/ws')) {
 			return runTerminalEffect(
-				Effect.map(terminalRegistry.getSession(sessionId), (session) => jsonResponse(request, session))
+				Effect.map(terminalRegistry.getSession(sessionId), (session) =>
+					jsonResponse(request, session)
+				)
 			).catch((error) => {
 				if (error instanceof SessionNotFound || error instanceof SessionClosed) {
 					return jsonResponse(request, { message: 'Session not found' }, 404);
@@ -555,7 +682,9 @@ const server = Bun.serve<SocketData>({
 
 		if (sessionId && url.pathname.endsWith('/ws')) {
 			const upgraded = server.upgrade(request, {
-				data: {}
+				data: {
+					expectedSessionId: sessionId
+				}
 			});
 
 			if (upgraded) {
@@ -568,6 +697,8 @@ const server = Bun.serve<SocketData>({
 		return jsonResponse(request, { message: 'Not found' }, 404);
 	},
 	websocket: {
+		backpressureLimit: WEBSOCKET_BACKPRESSURE_LIMIT,
+		closeOnBackpressureLimit: true,
 		open(socket) {
 			socket.data.clientId = randomUUID();
 			socket.data.attached = false;
@@ -606,22 +737,33 @@ const server = Bun.serve<SocketData>({
 					return;
 				}
 
+				if (socket.data.expectedSessionId && message.sessionId !== socket.data.expectedSessionId) {
+					sendEvent(socket, {
+						type: 'error',
+						message: 'WebSocket session id does not match the requested session'
+					});
+					socket.close(1008, 'Session id mismatch');
+					return;
+				}
+
 				void runTerminalEffect(
 					terminalRegistry.attachClient(message.sessionId, socket.data.clientId, socket, {
 						cols: message.cols ?? config.defaultCols,
 						rows: message.rows ?? config.defaultRows
 					})
-				).then(() => {
-					socket.data.sessionId = message.sessionId;
-					socket.data.attached = true;
-				}).catch((error) => {
-					console.error('Failed to attach client', error);
-					sendEvent(socket, {
-						type: 'error',
-						message: 'Session is unavailable'
+				)
+					.then(() => {
+						socket.data.sessionId = message.sessionId;
+						socket.data.attached = true;
+					})
+					.catch((error) => {
+						console.error('Failed to attach client', error);
+						sendEvent(socket, {
+							type: 'error',
+							message: 'Session is unavailable'
+						});
+						socket.close();
 					});
-					socket.close();
-				});
 				return;
 			}
 

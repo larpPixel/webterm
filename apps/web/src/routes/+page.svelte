@@ -16,6 +16,7 @@
 	let activeSessionId = $state<string | null>(null);
 	let errorMessage = $state<string | null>(null);
 	let isCreating = $state(false);
+	let closingSessionIds = $state<string[]>([]);
 
 	async function createTab() {
 		if (isCreating) {
@@ -44,7 +45,7 @@
 		}
 	}
 
-	async function closeTab(sessionId: string) {
+	function removeTab(sessionId: string) {
 		const previousTabs = tabs;
 		const removedIndex = previousTabs.findIndex((tab) => tab.sessionId === sessionId);
 		const remainingTabs = previousTabs.filter((tab) => tab.sessionId !== sessionId);
@@ -56,11 +57,32 @@
 			activeSessionId =
 				remainingTabs[fallbackIndex]?.sessionId ?? remainingTabs[0]?.sessionId ?? null;
 		}
+	}
+
+	async function closeTab(sessionId: string) {
+		if (closingSessionIds.includes(sessionId)) {
+			return;
+		}
+
+		closingSessionIds = [...closingSessionIds, sessionId];
+		errorMessage = null;
 
 		try {
-			await fetch(`${terminalServerUrl}/api/sessions/${sessionId}`, { method: 'DELETE' });
+			const response = await fetch(`${terminalServerUrl}/api/sessions/${sessionId}`, {
+				method: 'DELETE'
+			});
+
+			if (!response.ok && response.status !== 404) {
+				errorMessage = `Failed to close session (${response.status})`;
+				return;
+			}
+
+			removeTab(sessionId);
 		} catch (error) {
 			console.error('Failed to close terminal session', error);
+			errorMessage = 'Failed to reach terminal server while closing session.';
+		} finally {
+			closingSessionIds = closingSessionIds.filter((id) => id !== sessionId);
 		}
 	}
 
@@ -117,6 +139,7 @@
 							: 'opacity-0 group-hover:opacity-100'}"
 						title="Close terminal"
 						onclick={() => closeTab(tab.sessionId)}
+						disabled={closingSessionIds.includes(tab.sessionId)}
 					>
 						<X size={12} />
 					</button>

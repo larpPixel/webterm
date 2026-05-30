@@ -1,9 +1,9 @@
 <script lang="ts">
 	import { onDestroy, onMount } from 'svelte';
 	import { env } from '$env/dynamic/public';
-	import { FitAddon, Terminal } from 'ghostty-web';
+	import { WTerm } from '@wterm/dom';
+	import '@wterm/dom/css';
 	import { parseServerEvent } from '@webterm/protocol';
-	import { ensureGhosttyInitialized } from '$lib/ghostty';
 
 	let {
 		sessionId,
@@ -16,11 +16,13 @@
 	} = $props();
 
 	let terminalContainer: HTMLElement;
-	let term: InstanceType<typeof Terminal>;
-	let fitAddon: FitAddon;
+	let term: WTerm | null = null;
 	let socket: WebSocket | null = null;
 	let hasExited = false;
 	let isFocused = false;
+	let outputAnimationFrame: number | null = null;
+	let pendingTerminalOutput = '';
+	let lastSentResize: { cols: number; rows: number } | null = null;
 
 	type KeyboardNavigator = Navigator & {
 		keyboard?: {
@@ -33,6 +35,7 @@
 	const terminalFontFamily =
 		env.PUBLIC_TERMINAL_FONT_FAMILY ||
 		'"JetBrains Mono NFM", "JetBrainsMono Nerd Font", "JetBrains Mono", "CaskaydiaMono Nerd Font", "FiraCode Nerd Font", "SF Mono", Menlo, Monaco, "Courier New", monospace';
+	const maxTerminalWriteCharsPerFrame = 64 * 1024;
 
 	const toWebSocketUrl = (serverUrl: string, currentSessionId: string) => {
 		const wsBase = serverUrl
@@ -42,14 +45,54 @@
 		return `${wsBase}/api/sessions/${currentSessionId}/ws`;
 	};
 
-	const sendResize = () => {
-		if (socket?.readyState === WebSocket.OPEN && term.cols && term.rows) {
-			socket.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }));
+	const sendResize = (cols: number, rows: number) => {
+		if (socket?.readyState !== WebSocket.OPEN) {
+			return;
 		}
+
+		if (lastSentResize?.cols === cols && lastSentResize.rows === rows) {
+			return;
+		}
+
+		lastSentResize = { cols, rows };
+		socket.send(JSON.stringify({ type: 'resize', cols, rows }));
 	};
 
 	const writeSystemMessage = (message: string) => {
-		term.writeln(`\x1b[3m${message}\x1b[0m`);
+		queueTerminalOutput(`\x1b[3m${message}\x1b[0m\r\n`);
+	};
+
+	const flushTerminalOutput = () => {
+		outputAnimationFrame = null;
+
+		if (!term || pendingTerminalOutput.length === 0) {
+			return;
+		}
+
+		const chunk = pendingTerminalOutput.slice(0, maxTerminalWriteCharsPerFrame);
+		pendingTerminalOutput = pendingTerminalOutput.slice(chunk.length);
+		term.write(chunk);
+
+		if (pendingTerminalOutput.length > 0) {
+			scheduleTerminalOutputFlush();
+		}
+	};
+
+	const scheduleTerminalOutputFlush = () => {
+		if (outputAnimationFrame !== null) {
+			return;
+		}
+
+		outputAnimationFrame = requestAnimationFrame(flushTerminalOutput);
+	};
+
+	const queueTerminalOutput = (data: string) => {
+		if (data.length === 0) {
+			return;
+		}
+
+		pendingTerminalOutput += data;
+		scheduleTerminalOutputFlush();
 	};
 
 	const getKeyboardNavigator = () => {
@@ -100,70 +143,36 @@
 		let cancelled = false;
 
 		void (async () => {
-			await ensureGhosttyInitialized();
+			terminalContainer.style.setProperty('--term-font-family', terminalFontFamily);
+
+			term = new WTerm(terminalContainer, {
+				cols: 120,
+				rows: 36,
+				autoResize: true,
+				cursorBlink: true,
+				onData(data) {
+					if (socket?.readyState === WebSocket.OPEN) {
+						socket.send(JSON.stringify({ type: 'input', data }));
+					}
+				},
+				onTitle(title) {
+					onTitleChange?.(title);
+				},
+				onResize(cols, rows) {
+					sendResize(cols, rows);
+				}
+			});
+
+			await term.init();
 
 			if (cancelled) {
 				return;
 			}
 
-			term = new Terminal({
-				fontFamily: terminalFontFamily,
-				fontSize: 14,
-				cursorBlink: true,
-				theme: {
-					background: '#09090b',
-					foreground: '#f4f4f5',
-					cursor: '#d4d4d8',
-					selectionBackground: '#27272a',
-					black: '#18181b',
-					red: '#ef4444',
-					green: '#22c55e',
-					yellow: '#eab308',
-					blue: '#3b82f6',
-					magenta: '#d946ef',
-					cyan: '#06b6d4',
-					white: '#f4f4f5',
-					brightBlack: '#52525b',
-					brightRed: '#f87171',
-					brightGreen: '#4ade80',
-					brightYellow: '#fde047',
-					brightBlue: '#60a5fa',
-					brightMagenta: '#e879f9',
-					brightCyan: '#22d3ee',
-					brightWhite: '#fafafa'
-				}
-			});
+			if (isActive) {
+				term.focus();
+			}
 
-			fitAddon = new FitAddon();
-			term.loadAddon(fitAddon);
-			term.open(terminalContainer);
-			terminalContainer.style.caretColor = 'transparent';
-
-			// Fit immediately (like the official ghostty-web demo).
-			fitAddon.fit();
-
-			// Use ghostty-web's built-in resize observer (debounced, watches
-			// term.element). This replaces our manual ResizeObserver.
-			fitAddon.observeResize();
-
-			// Backup: window resize doesn't always trigger ResizeObserver on
-			// every browser.
-			window.addEventListener('resize', handleWindowResize);
-
-			void document.fonts.ready.then(() => {
-				if (cancelled) {
-					return;
-				}
-
-				fitAddon.fit();
-				sendResize();
-
-				if (isActive) {
-					term.focus();
-				}
-			});
-
-			term.onTitleChange((title) => onTitleChange?.(title));
 			terminalContainer.addEventListener('focusin', handleTerminalFocusIn);
 			terminalContainer.addEventListener('focusout', handleTerminalFocusOut);
 			terminalContainer.addEventListener('pointerdown', handleTerminalPointerDown);
@@ -172,6 +181,10 @@
 			socket = new WebSocket(wsUrl);
 
 			socket.onopen = () => {
+				if (!term) {
+					return;
+				}
+
 				socket?.send(
 					JSON.stringify({
 						type: 'attach',
@@ -180,6 +193,7 @@
 						rows: term.rows
 					})
 				);
+				lastSentResize = { cols: term.cols, rows: term.rows };
 			};
 
 			socket.onmessage = (event) => {
@@ -197,15 +211,13 @@
 
 					switch (message.type) {
 						case 'ready':
-							fitAddon.fit();
-							sendResize();
 							if (isActive) {
-								term.focus();
+								term?.focus();
 							}
 							return;
 
 						case 'output':
-							term.write(message.data);
+							queueTerminalOutput(message.data);
 							return;
 
 						case 'error':
@@ -214,9 +226,7 @@
 
 						case 'exit':
 							hasExited = true;
-							writeSystemMessage(
-								`[process exited with code ${message.exitCode ?? 'null'}]`
-							);
+							writeSystemMessage(`[process exited with code ${message.exitCode ?? 'null'}]`);
 							return;
 					}
 				} catch (error) {
@@ -234,18 +244,6 @@
 					writeSystemMessage('[disconnected from server]');
 				}
 			};
-
-			term.onData((data) => {
-				if (socket?.readyState === WebSocket.OPEN) {
-					socket.send(JSON.stringify({ type: 'input', data }));
-				}
-			});
-
-			term.onResize(({ cols, rows }) => {
-				if (socket?.readyState === WebSocket.OPEN) {
-					socket.send(JSON.stringify({ type: 'resize', cols, rows }));
-				}
-			});
 		})();
 
 		return () => {
@@ -253,29 +251,22 @@
 		};
 	});
 
-	const handleWindowResize = () => {
-		if (isActive && fitAddon) {
-			fitAddon.fit();
-		}
-	};
-
 	$effect(() => {
-		if (isActive && fitAddon && term) {
-			fitAddon.fit();
-			sendResize();
+		if (isActive && term) {
 			term.focus();
 		}
 	});
 
 	onDestroy(() => {
+		if (outputAnimationFrame !== null) {
+			cancelAnimationFrame(outputAnimationFrame);
+		}
 		terminalContainer?.removeEventListener('focusin', handleTerminalFocusIn);
 		terminalContainer?.removeEventListener('focusout', handleTerminalFocusOut);
 		terminalContainer?.removeEventListener('pointerdown', handleTerminalPointerDown);
-		window?.removeEventListener('resize', handleWindowResize);
 		releaseKeyboardLock();
-		fitAddon?.dispose();
 		socket?.close();
-		term?.dispose();
+		term?.destroy();
 	});
 </script>
 
@@ -287,20 +278,47 @@
 
 <style>
 	.terminal-container {
+		--term-bg: #09090b;
+		--term-fg: #f4f4f5;
+		--term-cursor: #d4d4d8;
+		--term-font-size: 14px;
+		--term-color-0: #18181b;
+		--term-color-1: #ef4444;
+		--term-color-2: #22c55e;
+		--term-color-3: #eab308;
+		--term-color-4: #3b82f6;
+		--term-color-5: #d946ef;
+		--term-color-6: #06b6d4;
+		--term-color-7: #f4f4f5;
+		--term-color-8: #52525b;
+		--term-color-9: #f87171;
+		--term-color-10: #4ade80;
+		--term-color-11: #fde047;
+		--term-color-12: #60a5fa;
+		--term-color-13: #e879f9;
+		--term-color-14: #22d3ee;
+		--term-color-15: #fafafa;
 		position: absolute;
 		inset: 0;
-		overflow: hidden;
+		box-sizing: border-box;
 		padding: 10px 12px;
-	}
-	.terminal-container :global(canvas) {
-		display: block;
+		overflow: hidden;
+		border-radius: 0;
+		background: var(--term-bg);
+		box-shadow: none;
 		outline: none;
 	}
-	:global(.terminal-container[contenteditable='true']) {
-		caret-color: transparent;
+
+	:global(.terminal-container.wterm.has-scrollback) {
+		overflow-y: auto;
 	}
-	.terminal-container :global(textarea[aria-label='Terminal input']) {
-		caret-color: transparent;
-		color: transparent;
+
+	:global(.terminal-container.wterm ::selection) {
+		background: #27272a;
+	}
+
+	.terminal-container :global(.term-grid) {
+		max-width: 100%;
+		overflow: hidden;
 	}
 </style>
