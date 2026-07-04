@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { onDestroy, onMount } from 'svelte';
 	import { env } from '$env/dynamic/public';
-	import { WTerm } from '@wterm/dom';
+	import { WTerm, type TerminalCore, type WTermOptions } from '@wterm/dom';
 	import '@wterm/dom/css';
 	import { parseServerEvent } from '@webterm/protocol';
 
@@ -22,6 +22,7 @@
 	let isFocused = false;
 	let outputAnimationFrame: number | null = null;
 	let pendingTerminalOutput = '';
+	let pendingTitleSequence = '';
 	let lastSentResize: { cols: number; rows: number } | null = null;
 
 	type KeyboardNavigator = Navigator & {
@@ -35,7 +36,35 @@
 	const terminalFontFamily =
 		env.PUBLIC_TERMINAL_FONT_FAMILY ||
 		'"JetBrains Mono NFM", "JetBrainsMono Nerd Font", "JetBrains Mono", "CaskaydiaMono Nerd Font", "FiraCode Nerd Font", "SF Mono", Menlo, Monaco, "Courier New", monospace';
+	const terminalCorePreference = (env.PUBLIC_TERMINAL_CORE ?? 'builtin').trim().toLowerCase();
 	const maxTerminalWriteCharsPerFrame = 64 * 1024;
+	const maxTitleSequenceBufferChars = 2048;
+
+	const loadTerminalCore = async (): Promise<TerminalCore | undefined> => {
+		if (
+			terminalCorePreference === '' ||
+			terminalCorePreference === 'builtin' ||
+			terminalCorePreference === 'wterm'
+		) {
+			return undefined;
+		}
+
+		if (terminalCorePreference !== 'ghostty') {
+			console.warn(`Unknown terminal core "${terminalCorePreference}"; using built-in WTerm core.`);
+			return undefined;
+		}
+
+		try {
+			const { GhosttyCore } = await import('@wterm/ghostty');
+			return await GhosttyCore.load();
+		} catch (error) {
+			console.warn(
+				'Failed to load Ghostty terminal core; falling back to built-in WTerm core.',
+				error
+			);
+			return undefined;
+		}
+	};
 
 	const toWebSocketUrl = (serverUrl: string, currentSessionId: string) => {
 		const wsBase = serverUrl
@@ -60,6 +89,46 @@
 
 	const writeSystemMessage = (message: string) => {
 		queueTerminalOutput(`\x1b[3m${message}\x1b[0m\r\n`);
+	};
+
+	const updateTitleFromTerminalOutput = (data: string) => {
+		let buffer = pendingTitleSequence + data;
+		let offset = 0;
+		pendingTitleSequence = '';
+
+		while (true) {
+			const oscStart = buffer.indexOf('\x1b]', offset);
+
+			if (oscStart === -1) {
+				break;
+			}
+
+			const belEnd = buffer.indexOf('\x07', oscStart + 2);
+			const stEnd = buffer.indexOf('\x1b\\', oscStart + 2);
+			const useBel = belEnd !== -1 && (stEnd === -1 || belEnd < stEnd);
+			const endIndex = useBel ? belEnd : stEnd;
+
+			if (endIndex === -1) {
+				const pendingSequence = buffer.slice(oscStart);
+				pendingTitleSequence =
+					pendingSequence.length <= maxTitleSequenceBufferChars ? pendingSequence : '';
+				return;
+			}
+
+			const sequence = buffer.slice(oscStart + 2, endIndex);
+			const separatorIndex = sequence.indexOf(';');
+			const command = separatorIndex === -1 ? sequence : sequence.slice(0, separatorIndex);
+
+			if (separatorIndex !== -1 && (command === '0' || command === '1' || command === '2')) {
+				onTitleChange?.(sequence.slice(separatorIndex + 1));
+			}
+
+			offset = endIndex + (useBel ? 1 : 2);
+		}
+
+		if (buffer.endsWith('\x1b')) {
+			pendingTitleSequence = '\x1b';
+		}
 	};
 
 	const flushTerminalOutput = () => {
@@ -91,6 +160,7 @@
 			return;
 		}
 
+		updateTitleFromTerminalOutput(data);
 		pendingTerminalOutput += data;
 		scheduleTerminalOutputFlush();
 	};
@@ -144,8 +214,14 @@
 
 		void (async () => {
 			terminalContainer.style.setProperty('--term-font-family', terminalFontFamily);
+			const terminalCore = await loadTerminalCore();
 
-			term = new WTerm(terminalContainer, {
+			if (cancelled) {
+				return;
+			}
+
+			const terminalOptions: WTermOptions = {
+				...(terminalCore ? { core: terminalCore } : {}),
 				cols: 120,
 				rows: 36,
 				autoResize: true,
@@ -161,7 +237,9 @@
 				onResize(cols, rows) {
 					sendResize(cols, rows);
 				}
-			});
+			};
+
+			term = new WTerm(terminalContainer, terminalOptions);
 
 			await term.init();
 
@@ -302,14 +380,18 @@
 		inset: 0;
 		box-sizing: border-box;
 		padding: 10px 12px;
-		overflow: hidden;
+		overflow-x: hidden;
+		overflow-y: auto;
+		overscroll-behavior: contain;
+		scrollbar-gutter: stable;
 		border-radius: 0;
 		background: var(--term-bg);
 		box-shadow: none;
 		outline: none;
 	}
 
-	:global(.terminal-container.wterm.has-scrollback) {
+	:global(.terminal-container.wterm) {
+		overflow-x: hidden;
 		overflow-y: auto;
 	}
 

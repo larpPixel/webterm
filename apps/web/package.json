@@ -38,6 +38,7 @@
 	"dependencies": {
 		"@webterm/protocol": "workspace:*",
 		"@wterm/dom": "^0.3.0",
+		"@wterm/ghostty": "0.3.0",
 		"lucide-svelte": "^1.0.1"
 	}
 }

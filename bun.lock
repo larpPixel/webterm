@@ -21,6 +21,7 @@
       "dependencies": {
         "@webterm/protocol": "workspace:*",
         "@wterm/dom": "^0.3.0",
+        "@wterm/ghostty": "0.3.0",
         "lucide-svelte": "^1.0.1",
       },
       "devDependencies": {
@@ -294,6 +295,8 @@
     "@wterm/core": ["@wterm/core@0.3.0", "", {}, "sha512-aQ73QBP+eyA3kcn31mA7DmAi7qmEsQijZdmvgwxtSjCi2248EAOZgtkGDpjlspfrxyVxQbUl/IF+gCVcXt4nZQ=="],
 
     "@wterm/dom": ["@wterm/dom@0.3.0", "", { "dependencies": { "@wterm/core": "0.3.0" } }, "sha512-OiUl7reGSlW02yb5wGXMplMZhW2HBkBSFxvbFj15I832UK0QFIHRvhE2l6Xgae8ROn9bNLaALoKDFvcUuz80iQ=="],
+
+    "@wterm/ghostty": ["@wterm/ghostty@0.3.0", "", { "dependencies": { "@wterm/core": "0.3.0" } }, "sha512-TDjEmUSRD7IaFxq31P7+I3Inkp5mHCfBfO6LYj3/vbLbWOkOZOKPhjAcZ36AYFHe9Q0HLCFvLWmrxIO3aGCjDA=="],
 
     "acorn": ["acorn@8.16.0", "", { "bin": { "acorn": "bin/acorn" } }, "sha512-UVJyE9MttOsBQIDKw1skb9nAwQuR5wuGD3+82K6JgJlm/Y+KI92oNsMNGZCYdDsVtRHSak0pcV5Dno5+4jh9sw=="],
 
