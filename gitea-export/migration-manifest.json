@@ -1,0 +1,23 @@
+{
+  "source": "jR4dh3y/webterm",
+  "source_url": "https://git.jr4.in/jR4dh3y/webterm",
+  "destination": "larpPixel/webterm",
+  "visibility": "public",
+  "default_branch": "main",
+  "original_git_refs": {
+    "source": "jR4dh3y/webterm",
+    "name": "webterm",
+    "private": false,
+    "source_present": true,
+    "branches": {
+      "refs/heads/main": "a909e817345dd3256ad1f38177bf89f65a607b59"
+    },
+    "tags": {},
+    "other_refs": {},
+    "oversized_blobs": []
+  },
+  "github_archival_ref_mapping": {},
+  "discussion_mapping": {},
+  "recovered_refs": {},
+  "limitations": []
+}
